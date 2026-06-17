@@ -516,24 +516,376 @@ def check_ffmpeg():
     except FileNotFoundError:
         pass
     return False
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+
+def get_direct_audio_links(url):
+    """
+    Универсальный парсер: ищет прямые ссылки на mp3 И извлекает названия треков.
+    Возвращает список словарей: [{'url': ..., 'title': ..., 'filename': ...}, ...]
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': url,
+    }
+    
+    try:
+        print(f"\n🔍 Анализирую страницу {url}...")
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        html = response.text
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # === ШАГ 1: Извлекаем общее название трека/страницы ===
+        page_title = None
+        
+        # Ищем в <h1>
+        h1 = soup.find('h1')
+        if h1:
+            page_title = h1.get_text(strip=True)
+        
+        # Если нет — берём из <title>
+        if not page_title:
+            title_tag = soup.find('title')
+            if title_tag:
+                page_title = title_tag.get_text(strip=True)
+                # Чистим от мусора типа " - сайт.com"
+                for sep in [' - ', ' | ', ' :: ', ' — ']:
+                    if sep in page_title:
+                        page_title = page_title.split(sep)[0].strip()
+                        break
+        
+        # Если нет — ищем в мета-тегах
+        if not page_title:
+            og_title = soup.find('meta', property='og:title')
+            if og_title:
+                page_title = og_title.get('content', '').strip()
+        
+        if not page_title:
+            page_title = "audio_track"
+        
+        # Чистим название от недопустимых символов
+        page_title_clean = re.sub(r'[<>:"/\\|?*]', '_', page_title)[:80].strip()
+        print(f"📌 Название страницы: {page_title_clean}")
+        
+        # === ШАГ 2: Ищем ссылки на аудиофайлы ===
+        audio_links = []
+        seen_urls = set()
+        
+        # Паттерны для поиска URL аудиофайлов в HTML/JS
+        patterns = [
+            r'(https?://[^\s"\'<>]+\.mp3(?:\?[^\s"\'<>]*)?)',
+            r'(https?://[^\s"\'<>]+\.m4a(?:\?[^\s"\'<>]*)?)',
+            r'(https?://[^\s"\'<>]+\.ogg(?:\?[^\s"\'<>]*)?)',
+            r'data-(?:src|url|audio|file|mp3)=["\']([^"\']+\.(?:mp3|m4a|ogg|wav))["\']',
+            r'file:\s*["\']([^"\']+\.(?:mp3|m4a|ogg|wav))["\']',
+            r'source:\s*["\']([^"\']+\.(?:mp3|m4a|ogg|wav))["\']',
+            r'"(\/[^"]+\.mp3[^"]*)"',
+            r"'(\/[^']+\.mp3[^']*)'",
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            for match in matches:
+                full_url = match if match.startswith('http') else urljoin(url, match)
+                # Убираем query-параметры для уникализации
+                base_url = full_url.split('?')[0]
+                if base_url not in seen_urls:
+                    seen_urls.add(base_url)
+                    audio_links.append(full_url)
+        
+        # Также ищем в тегах <audio> и <source>
+        for audio in soup.find_all(['audio', 'source']):
+            src = audio.get('src') or audio.get('data-src')
+            if src:
+                full_url = urljoin(url, src)
+                base_url = full_url.split('?')[0]
+                if base_url not in seen_urls:
+                    seen_urls.add(base_url)
+                    audio_links.append(full_url)
+        
+        # === ШАГ 3: Формируем список с названиями ===
+        result = []
+        
+        # Пытаемся найти названия для каждого трека в HTML
+        # Ищем элементы с классами, содержащими "title", "name", "song", "track"
+        title_candidates = []
+        for tag in soup.find_all(['div', 'span', 'p', 'h2', 'h3', 'a']):
+            classes = ' '.join(tag.get('class', []))
+            if any(word in classes.lower() for word in ['title', 'name', 'song', 'track', 'artist']):
+                text = tag.get_text(strip=True)
+                if text and 3 < len(text) < 100 and text != page_title:
+                    title_candidates.append(text)
+        
+        # Если нашли кандидатов — сопоставляем с треками
+        if len(title_candidates) == len(audio_links) and len(audio_links) > 1:
+            # Идеальный случай: названий столько же, сколько треков
+            for i, link in enumerate(audio_links):
+                filename_from_url = os.path.basename(urlparse(link).path)
+                result.append({
+                    'url': link,
+                    'title': title_candidates[i],
+                    'filename': re.sub(r'[<>:"/\\|?*]', '_', title_candidates[i])[:80] + '.mp3'
+                })
+        else:
+            # Используем название страницы
+            if len(audio_links) == 1:
+                # Один трек — используем название страницы
+                result.append({
+                    'url': audio_links[0],
+                    'title': page_title_clean,
+                    'filename': page_title_clean + '.mp3'
+                })
+            else:
+                # Несколько треков — добавляем номера
+                for i, link in enumerate(audio_links, 1):
+                    filename_from_url = os.path.basename(urlparse(link).path)
+                    name_without_ext = os.path.splitext(filename_from_url)[0]
+                    
+                    # Если имя файла выглядит как ID/дата — используем название страницы + номер
+                    if name_without_ext.isdigit() or len(name_without_ext) > 15:
+                        track_title = f"{page_title_clean} - Трек {i}"
+                    else:
+                        track_title = name_without_ext
+                    
+                    result.append({
+                        'url': link,
+                        'title': track_title,
+                        'filename': re.sub(r'[<>:"/\\|?*]', '_', track_title)[:80] + '.mp3'
+                    })
+        
+        return result, page_title_clean
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка доступа к сайту: {e}")
+        return [], None
+    except Exception as e:
+        print(f"❌ Ошибка парсинга: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], None
+
+
+def download_audio_from_generic_site(url, output_path="downloads/music"):
+    """
+    Опция 4: Скачивание аудио с ЛЮБОГО сайта через прямой парсинг.
+    Теперь с нормальными названиями треков!
+    """
+    os.makedirs(output_path, exist_ok=True)
+    
+    audio_data, page_title = get_direct_audio_links(url)
+    
+    if not audio_data:
+        print("\n⚠️ Не удалось найти аудиофайлы на странице.")
+        print("💡 Возможные причины:")
+        print("   • Сайт использует защиту от парсинга")
+        print("   • Аудио загружается динамически через JavaScript")
+        print("   • Файлы имеют нестандартное расширение")
+        print("\n💡 Решение: откройте страницу в браузере,")
+        print("   нажмите F12 → вкладка Network → отфильтруйте по 'Media'")
+        print("   и скопируйте прямую ссылку на mp3 файл.")
+        
+        manual_url = input("\n🔗 Или вставьте прямую ссылку на mp3 вручную (или Enter для отмены): ").strip()
+        if manual_url:
+            filename = os.path.basename(urlparse(manual_url).path) or "audio.mp3"
+            audio_data = [{'url': manual_url, 'title': filename, 'filename': filename}]
+            page_title = "manual_download"
+        else:
+            return False
+    
+    print(f"\n✅ Найдено аудиофайлов: {len(audio_data)}")
+    
+    # --- ОДИН ФАЙЛ ---
+    if len(audio_data) == 1:
+        track = audio_data[0]
+        print(f"\n🎵 Название: {track['title']}")
+        print(f"   URL: {track['url'][:70]}...")
+        return download_single_audio_file_named(track['url'], track['filename'], output_path)
+    
+    # --- НЕСКОЛЬКО ФАЙЛОВ ---
+    print("\n" + "=" * 65)
+    print(f"📋 СПИСОК ТРЕКОВ (альбом: {page_title}):")
+    print("=" * 65)
+    
+    for i, track in enumerate(audio_data, 1):
+        print(f"{i:3}. 🎵 {track['title'][:60]}")
+        print(f"     📁 {track['filename'][:60]}")
+    
+    print("=" * 65)
+    print("💡 Форматы выбора:")
+    print("  • all        — скачать все файлы")
+    print("  • 1,3,5      — скачать конкретные номера")
+    print("  • 1-5        — скачать диапазон")
+    print("  • 0          — отмена")
+    print("=" * 65)
+    
+    while True:
+        choice = input("\n👉 Ваш выбор (all / номера / 0): ").strip()
+        if choice == '0':
+            print("❌ Отменено.")
+            return False
+        indices = parse_selection(choice, len(audio_data))
+        if indices is not None and len(indices) > 0:
+            break
+        print("❌ Неверный ввод. Попробуйте снова.")
+    
+    # Создаём подпапку по имени альбома/страницы
+    safe_title = re.sub(r'[<>:"/\\|?*]', '_', page_title or 'audio')[:60]
+    album_dir = os.path.join(output_path, safe_title)
+    os.makedirs(album_dir, exist_ok=True)
+    
+    print(f"\n📥 Буду скачивать {len(indices)} трек(ов) в папку: {album_dir}")
+    
+    success_count = 0
+    failed_count = 0
+    
+    for idx in indices:
+        track = audio_data[idx]
+        file_path = os.path.join(album_dir, track['filename'])
+        
+        print(f"\n[{success_count + failed_count + 1}/{len(indices)}] 🎵 {track['title'][:50]}...")
+        
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': url,
+            }
+            response = requests.get(track['url'], headers=headers, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded_size = 0
+            
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        if total_size > 0:
+                            percent = (downloaded_size / total_size) * 100
+                            print(f"\r   📥 {percent:.1f}% ({downloaded_size / 1024 / 1024:.1f} MB)", end='', flush=True)
+            
+            print()
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10 * 1024:
+                size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                print(f"   ✅ Готово ({size_mb:.1f} MB)")
+                success_count += 1
+            else:
+                print(f"   ⚠️ Файл слишком маленький")
+                failed_count += 1
+                
+        except Exception as e:
+            print(f"\n   ❌ Ошибка: {str(e)[:100]}")
+            failed_count += 1
+    
+    print("\n" + "=" * 65)
+    print(f"✅ ГОТОВО! Успешно: {success_count} | Ошибок: {failed_count}")
+    print(f"📁 Папка: {os.path.abspath(album_dir)}")
+    print("=" * 65)
+    return success_count > 0
+
+
+def download_single_audio_file_named(url, filename, output_path):
+    """Скачивает один аудиофайл с заданным именем"""
+    safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)[:80]
+    file_path = os.path.join(output_path, safe_filename)
+    
+    print(f"\n📥 Скачиваю: {safe_filename}")
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': url,
+        }
+        response = requests.get(url, headers=headers, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded_size = 0
+        
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    if total_size > 0:
+                        percent = (downloaded_size / total_size) * 100
+                        print(f"\r📥 {percent:.1f}% ({downloaded_size / 1024 / 1024:.1f} MB)", end='', flush=True)
+        
+        print()
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 10 * 1024:
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            print(f"\n✅ ГОТОВО!")
+            print(f"📁 Путь: {os.path.abspath(file_path)}")
+            print(f"📊 Размер: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"\n❌ Файл повреждён или пуст")
+            return False
+            
+    except Exception as e:
+        print(f"\n❌ Ошибка: {e}")
+        return False
+
+
+def parse_selection(input_str, total_count):
+    """
+    Парсит выбор пользователя: 'all', '1,3,5', '1-5', '2'.
+    Возвращает список индексов (0-based) или None при ошибке.
+    """
+    input_str = input_str.strip().lower()
+    if input_str == 'all':
+        return list(range(total_count))
+    if input_str == '0':
+        return None
+    
+    indices = []
+    parts = input_str.replace(' ', '').split(',')
+    for part in parts:
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                s, e = int(start), int(end)
+                if 1 <= s <= e <= total_count:
+                    indices.extend(range(s - 1, e))
+                else:
+                    print(f"❌ Диапазон {part} вне границ (1-{total_count})")
+                    return None
+            except ValueError:
+                print(f"❌ Неверный диапазон: {part}")
+                return None
+        else:
+            try:
+                num = int(part)
+                if 1 <= num <= total_count:
+                    indices.append(num - 1)
+                else:
+                    print(f"❌ Номер {num} вне границ (1-{total_count})")
+                    return None
+            except ValueError:
+                print(f"❌ Неверный номер: {part}")
+                return None
+    return indices
 
 def main():
     print("=" * 50)
-    print("🎬 Video Downloader v4.5")
+    print("🎬 Video Downloader v4.6")
     print("=" * 50)
-    
     if not check_ffmpeg():
         print("\n⚠️ FFMPEG НЕ НАЙДЕН! Обрезка работать не будет.")
         print("Скачайте: https://ffmpeg.org/download.html\n")
-    
+
     while True:
         print("\n📋 МЕНЮ:")
         print("1. 🎬 Видео с обрезкой (с выбором качества)")
         print("2. 📀 Плейлист (с выбором качества + звук)")
-        print("3. 🎵 Аудио")
-        print("4. 🚪 Выход")
+        print("3. 🎵 Аудио (YouTube, SoundCloud и др.)")
+        print("4. 🎧 Аудио с ЛЮБОГО сайта (парсер)")
+        print("5. 🚪 Выход")
         
-        choice = input("\n👉 Выбор (1,2,3,4): ").strip()
+        choice = input("\n👉 Выбор (1-5): ").strip()
         
         if choice == '1':
             url = input("🔗 Ссылка: ").strip()
@@ -548,10 +900,212 @@ def main():
             if url:
                 download_audio(url)
         elif choice == '4':
+            url = input("🔗 Ссылка на страницу с аудио: ").strip()
+            if url:
+                download_audio_from_generic_site(url)
+        elif choice == '5':
             print("\n👋 До свидания!")
             break
         else:
-            print("❌ Ошибка: выберите 1, 2, 3 или 4")
+            print("❌ Ошибка: выберите от 1 до 5")
+
+
+def get_audio_entries(url):
+    """
+    Получает список аудио-треков со страницы.
+    Возвращает: (list_of_entries, is_playlist, title, total_duration)
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'noplaylist': False,  # Важно: разрешаем извлекать плейлисты
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(extract_video_url(url), download=False)
+            if not info:
+                return None, False, None, 0
+
+            # Проверяем, это плейлист/альбом или одиночный трек
+            if 'entries' in info and info['entries']:
+                entries = [e for e in info['entries'] if e is not None]
+                if len(entries) > 1:
+                    total_dur = sum(e.get('duration', 0) or 0 for e in entries)
+                    return entries, True, info.get('title', 'Альбом/Плейлист'), total_dur
+
+            # Одиночный трек
+            return [info], False, info.get('title', 'Трек'), info.get('duration', 0)
+
+    except Exception as e:
+        print(f"❌ Ошибка получения информации: {e}")
+        return None, False, None, 0
+
+
+def parse_selection(input_str, total_count):
+    """
+    Парсит выбор пользователя: 'all', '1,3,5', '1-5', '2'.
+    Возвращает список индексов (0-based) или None при ошибке.
+    """
+    input_str = input_str.strip().lower()
+    if input_str == 'all':
+        return list(range(total_count))
+    if input_str == '0':
+        return None
+
+    indices = []
+    parts = input_str.replace(' ', '').split(',')
+    for part in parts:
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                s, e = int(start), int(end)
+                if 1 <= s <= e <= total_count:
+                    indices.extend(range(s - 1, e))
+                else:
+                    print(f"❌ Диапазон {part} вне границ (1-{total_count})")
+                    return None
+            except ValueError:
+                print(f"❌ Неверный диапазон: {part}")
+                return None
+        else:
+            try:
+                num = int(part)
+                if 1 <= num <= total_count:
+                    indices.append(num - 1)
+                else:
+                    print(f"❌ Номер {num} вне границ (1-{total_count})")
+                    return None
+            except ValueError:
+                print(f"❌ Неверный номер: {part}")
+                return None
+    return indices
+
+
+def download_audio_from_site(url, output_path="downloads/music"):
+    """
+    Скачивание аудио с сайтов, поддерживающих альбомы/плейлисты.
+    Автоматически определяет: один трек или несколько.
+    """
+    clean_url = extract_video_url(url)
+    os.makedirs(output_path, exist_ok=True)
+
+    print("\n Анализирую страницу...")
+    entries, is_playlist, title, total_duration = get_audio_entries(clean_url)
+
+    if not entries:
+        print("⚠️ Не удалось получить аудиофайлы. Возможно, ссылка не поддерживается.")
+        return False
+
+    print(f"\n Название: {title[:60]}")
+    print(f"📊 Найдено треков: {len(entries)}")
+    if total_duration:
+        print(f"⏱️ Общая длительность: {format_time(total_duration)}")
+
+    # --- ОДИНОЧНЫЙ ТРЕК ---
+    if not is_playlist or len(entries) == 1:
+        print("\n✅ Это одиночный трек. Использую стандартное скачивание MP3.")
+        return download_audio_best_quality(url, output_path)
+
+    # --- НЕСКОЛЬКО ТРЕКОВ ---
+    print("\n" + "=" * 65)
+    print("📋 СПИСОК ТРЕКОВ:")
+    print("=" * 65)
+
+    for i, entry in enumerate(entries, 1):
+        track_title = entry.get('title', f'Трек {i}')[:50]
+        dur = format_time(entry.get('duration', 0))
+        filesize = entry.get('filesize') or entry.get('filesize_approx')
+        size_str = f" ({filesize / (1024 * 1024):.1f} MB)" if filesize else ""
+        print(f"{i:3}. {track_title}  [{dur}]{size_str}")
+
+    print("=" * 65)
+    print("💡 Форматы выбора:")
+    print("  • all        — скачать все треки")
+    print("  • 1,3,5      — скачать конкретные номера")
+    print("  • 1-5        — скачать диапазон")
+    print("  • 1-3,7,9-11 — комбинированный выбор")
+    print("  • 0          — отмена")
+    print("=" * 65)
+
+    while True:
+        choice = input(f"\n Ваш выбор (all / номера / 0): ").strip()
+        if choice == '0':
+            print("❌ Отменено.")
+            return False
+        indices = parse_selection(choice, len(entries))
+        if indices is not None and len(indices) > 0:
+            break
+        print("❌ Неверный ввод. Попробуйте снова.")
+
+    print(f"\n📥 Буду скачивать {len(indices)} трек(ов)...")
+
+    # Настройки для скачивания MP3
+    print("\n Качество MP3 для всех треков:")
+    print("1. 320 kbps")
+    print("2. 192 kbps (рекомендуется)")
+    print("3. 128 kbps")
+    quality_choice = input("👉 Выбор (1-3): ").strip()
+    mp3_quality = {'1': '320', '2': '192', '3': '128'}.get(quality_choice, '192')
+
+    # Создаём подпапку для альбома/плейлиста
+    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:50].strip()
+    album_dir = os.path.join(output_path, safe_title)
+    os.makedirs(album_dir, exist_ok=True)
+
+    success_count = 0
+    failed_count = 0
+
+    for idx in indices:
+        entry = entries[idx]
+        track_title = entry.get('title', f'track_{idx + 1}')
+        track_url = entry.get('webpage_url') or entry.get('url') or clean_url
+        safe_track = re.sub(r'[<>:"/\\|?*]', '_', track_title)[:50].strip()
+        track_path = os.path.join(album_dir, f"{safe_track}.mp3")
+
+        print(f"\n[{success_count + failed_count + 1}/{len(indices)}] 📥 {track_title[:50]}...")
+
+        ydl_opts = {
+            'outtmpl': track_path,
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'noplaylist': True,
+            'ignoreerrors': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': mp3_quality,
+            }],
+        }
+        if COOKIES_FILE_EXISTS():
+            ydl_opts['cookiefile'] = 'cookies.txt'
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(track_url, download=True)
+
+            if os.path.exists(track_path) and os.path.getsize(track_path) > 100 * 1024:
+                size_mb = os.path.getsize(track_path) / (1024 * 1024)
+                print(f"   ✅ Готово ({size_mb:.1f} MB)")
+                success_count += 1
+            else:
+                print(f"   ⚠️ Файл слишком маленький или не создан")
+                failed_count += 1
+        except Exception as e:
+            print(f"   ❌ Ошибка: {str(e)[:100]}")
+            failed_count += 1
+
+    print("\n" + "=" * 65)
+    print(f"✅ ГОТОВО! Успешно: {success_count} | Ошибок: {failed_count}")
+    print(f"📁 Папка: {os.path.abspath(album_dir)}")
+    print(f"🎧 Качество: {mp3_quality} kbps")
+    print("=" * 65)
+    return success_count > 0
+
+
+def COOKIES_FILE_EXISTS():
+    """Проверка наличия cookies.txt"""
+    return os.path.exists('cookies.txt')
 
 if __name__ == "__main__":
     try:

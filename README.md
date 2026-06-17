@@ -68,6 +68,8 @@ https://www.python.org/downloads/
 pip install yt-dlp
 pip install yt-dlp-get-pot
 pip install "yt-dlp[default,curl-cffi]"
+pip install requests beautifulsoup4
+pip install mutagen
 ```
 
 Рекомендуется использовать nightly-сборку:
