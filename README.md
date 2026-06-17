@@ -123,6 +123,11 @@ python download_video.py
 start.bat
 ```
 ---
+## Требования
+
+Для работы приложения необходим FFmpeg. Скачайте последнюю версию:
+- Windows: https://www.gyan.dev/ffmpeg/builds/
+- Поместите `ffmpeg.exe`, `ffprobe.exe` и `ffplay.exe` в корень проекта
 
 ## 📸 Интерфейс программы
 
